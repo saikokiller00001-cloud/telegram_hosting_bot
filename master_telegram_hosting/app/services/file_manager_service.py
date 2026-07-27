@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import difflib
+import shutil
 from math import ceil
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.models.approval import Approval, ApprovalStatus
 from app.db.models.project import ChangeKind, FileVersion, Project, ProjectFile, ProjectStatus
+from app.db.models.run_instance import RunInstance
+from app.db.models.system import SystemEvent
 
 
 class FileManagerService:
@@ -55,7 +58,7 @@ class FileManagerService:
             raise ValueError("Project not found.")
 
         path = Path(project.storage_path) / project_file.relative_path
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
         chunk_size = self.settings.file_page_chars
         total_pages = max(1, ceil(max(len(text), 1) / chunk_size))
         page = max(0, min(page, total_pages - 1))
@@ -97,7 +100,7 @@ class FileManagerService:
             raise ValueError("Project not found.")
 
         path = Path(project.storage_path) / project_file.relative_path
-        original_text = path.read_text(encoding="utf-8", errors="ignore")
+        original_text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
         new_content, diff_preview = self._patch_text(original_text, start_line, end_line, replacement_text)
         return project, project_file, new_content, diff_preview
 
@@ -116,7 +119,7 @@ class FileManagerService:
         if not project:
             raise ValueError("Project not found.")
         path = Path(project.storage_path) / relative_path
-        original_text = path.read_text(encoding="utf-8", errors="ignore")
+        original_text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
         new_content, _ = self._patch_text(original_text, start_line, end_line, replacement_text)
         return await self._save_content(
             session,
@@ -126,6 +129,82 @@ class FileManagerService:
             editor_user_id=editor_user_id,
             change_kind=ChangeKind.PATCH,
         )
+
+    async def delete_file(self, session: AsyncSession, file_id: int) -> tuple[Project, ProjectFile]:
+        project_file = await self.get_file(session, file_id)
+        if not project_file:
+            raise ValueError("File not found.")
+
+        project = await session.scalar(select(Project).where(Project.id == project_file.project_id))
+        if not project:
+            raise ValueError("Project not found.")
+
+        absolute_path = (Path(project.storage_path) / project_file.relative_path).resolve()
+        project_root = Path(project.storage_path).resolve()
+        try:
+            absolute_path.relative_to(project_root)
+        except ValueError as exc:
+            raise ValueError("Unsafe file path detected.") from exc
+
+        if absolute_path.exists():
+            absolute_path.unlink()
+            self._cleanup_empty_dirs(absolute_path.parent, project_root)
+
+        versions = list(await session.scalars(select(FileVersion).where(FileVersion.project_file_id == project_file.id)))
+        for version in versions:
+            snapshot_path = Path(version.content_snapshot_path)
+            if snapshot_path.exists():
+                snapshot_path.unlink(missing_ok=True)
+        await session.execute(delete(FileVersion).where(FileVersion.project_file_id == project_file.id))
+        await session.delete(project_file)
+
+        if self.settings.auto_reapproval_on_edit:
+            project.status = ProjectStatus.PENDING_APPROVAL
+            session.add(
+                Approval(
+                    project_id=project.id,
+                    requested_by_user_id=project.owner_user_id,
+                    status=ApprovalStatus.PENDING,
+                    decision_reason=f"File {absolute_path.name} deleted; re-review required.",
+                )
+            )
+        await session.flush()
+        return project, project_file
+
+    async def destroy_project(self, session: AsyncSession, project_id: int) -> dict:
+        project = await session.scalar(select(Project).where(Project.id == project_id))
+        if not project:
+            raise ValueError("Project not found.")
+
+        payload = {
+            "id": project.id,
+            "name": project.name,
+            "owner_user_id": project.owner_user_id,
+            "slug": project.slug,
+            "status": project.status.value,
+            "storage_path": project.storage_path,
+        }
+
+        storage_root = Path(project.storage_path)
+        versions_root = self.settings.versions_root / project.slug
+
+        file_ids = list(await session.scalars(select(ProjectFile.id).where(ProjectFile.project_id == project.id)))
+        if file_ids:
+            await session.execute(delete(FileVersion).where(FileVersion.project_file_id.in_(file_ids)))
+        await session.execute(delete(Approval).where(Approval.project_id == project.id))
+        await session.execute(delete(SystemEvent).where(SystemEvent.project_id == project.id))
+        await session.execute(delete(RunInstance).where(RunInstance.project_id == project.id))
+        await session.execute(delete(ProjectFile).where(ProjectFile.project_id == project.id))
+        await session.delete(project)
+        await session.flush()
+
+        if storage_root.exists():
+            shutil.rmtree(storage_root, ignore_errors=True)
+        if versions_root.exists():
+            shutil.rmtree(versions_root, ignore_errors=True)
+        for log_file in self.settings.runtime_logs_root.glob(f"{payload['slug']}_*.log"):
+            log_file.unlink(missing_ok=True)
+        return payload
 
     def _patch_text(self, original_text: str, start_line: int, end_line: int, replacement_text: str) -> tuple[str, str]:
         lines = original_text.splitlines()
@@ -165,9 +244,7 @@ class FileManagerService:
         change_kind: ChangeKind,
     ) -> Project:
         project = await session.scalar(select(Project).where(Project.id == project_id))
-        project_file = await session.scalar(
-            select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.relative_path == relative_path)
-        )
+        project_file = await session.scalar(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.relative_path == relative_path))
         if not project or not project_file or not project_file.is_editable:
             raise ValueError("Editable file not found.")
 
@@ -180,10 +257,7 @@ class FileManagerService:
         path.write_text(new_content, encoding="utf-8")
         project_file.size_bytes = len(new_content.encode("utf-8"))
 
-        version_no = (
-            await session.scalar(select(func.max(FileVersion.version_no)).where(FileVersion.project_file_id == project_file.id))
-            or 0
-        ) + 1
+        version_no = (await session.scalar(select(func.max(FileVersion.version_no)).where(FileVersion.project_file_id == project_file.id)) or 0) + 1
 
         snapshot_path = self.settings.versions_root / project.slug / f"{project_file.id}_v{version_no}.snapshot"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,3 +295,12 @@ class FileManagerService:
                 )
             )
         return project
+
+    @staticmethod
+    def _cleanup_empty_dirs(current: Path, project_root: Path) -> None:
+        while current != project_root and current.exists():
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
