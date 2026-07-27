@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Alembic migrations for Master Telegram Hosting Bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+WorkingDirectory=/srv/master_telegram_hosting
+EnvironmentFile=/srv/master_telegram_hosting/.env
+ExecStart=/srv/master_telegram_hosting/.venv/bin/alembic upgrade head
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

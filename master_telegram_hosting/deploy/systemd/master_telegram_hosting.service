@@ -1,0 +1,26 @@
+[Unit]
+Description=Master Telegram Hosting Bot
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/srv/master_telegram_hosting
+EnvironmentFile=/srv/master_telegram_hosting/.env
+ExecStart=/srv/master_telegram_hosting/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=process
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/srv/master_telegram_hosting/storage
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
