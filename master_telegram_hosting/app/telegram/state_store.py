@@ -70,6 +70,16 @@ class StateStore:
             },
         )
 
+    async def set_packages_wait(self, telegram_user_id: int, project_id: int, runtime: str) -> None:
+        await self.set_state(
+            telegram_user_id,
+            {
+                "kind": "awaiting_packages",
+                "project_id": project_id,
+                "runtime": runtime,
+            },
+        )
+
     async def get_state(self, telegram_user_id: int) -> dict | None:
         raw = await self.client.get(f"state:{telegram_user_id}")
         return json.loads(raw) if raw else None
