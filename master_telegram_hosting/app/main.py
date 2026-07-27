@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from html import escape
 from math import ceil
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from app.services.approval_service import ApprovalService
 from app.services.audit_service import AuditService
 from app.services.file_manager_service import FileManagerService
 from app.services.logs_service import LogsService
+from app.services.module_manager_service import ModuleManagerService
 from app.services.notification_service import NotificationService
 from app.services.project_runtime_service import ProjectRuntimeService
 from app.services.upload_service import UploadService
@@ -63,6 +65,58 @@ async def safe_event_edit(event, *args, **kwargs):
     except MessageNotModifiedError:
         return None
 
+
+def parse_package_input(raw_text: str) -> list[str]:
+    packages: list[str] = []
+    seen: set[str] = set()
+
+    for chunk in re.split(r"[\n,]+", raw_text):
+        package_name = chunk.strip()
+        if not package_name or package_name in seen:
+            continue
+        packages.append(package_name)
+        seen.add(package_name)
+
+    return packages
+
+
+def render_module_install_result(project: Project, runtime: str, result: dict) -> str:
+    runtime_label = "pip" if runtime == "python" else "npm"
+    installed = result.get("installed", [])
+    failed = result.get("failed", [])
+
+    lines = [
+        "⚡ <b>Module Control Report</b>",
+        "",
+        f"Target project: <b>{escape(project.name)}</b>",
+        f"Runtime channel: <code>{runtime_label}</code>",
+        f"Queue processed: <code>{len(installed) + len(failed)}</code>",
+        f"Status: <code>{'OK' if result.get('success') else 'PARTIAL / FAILED'}</code>",
+        "",
+    ]
+
+    if installed:
+        lines.append("✅ <b>Installed</b>")
+        lines.extend(f"• <code>{escape(pkg)}</code>" for pkg in installed)
+        lines.append("")
+
+    if failed:
+        lines.append("❌ <b>Failed</b>")
+        for item in failed:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                pkg, reason = item[0], item[1]
+            else:
+                pkg, reason = str(item), "Unknown error"
+            lines.append(f"• <code>{escape(str(pkg))}</code> — {escape(str(reason))}")
+        lines.append("")
+
+    message = result.get("message")
+    if message:
+        lines.append(f"└─ {escape(str(message))}")
+
+    lines.append("")
+    lines.append("Ready for the next command.")
+    return "\n".join(lines)
 
 
 settings = get_settings()
@@ -193,6 +247,34 @@ async def callback_router(event):
             project = await get_owned_or_admin_project(session, user, project_id)
         await safe_event_edit(event, 
             render_project_card(project),
+            parse_mode="html",
+            buttons=project_actions_markup(project.id, project.status.value, is_admin=user.is_admin),
+        )
+        return
+
+    if data.startswith("project:modules:"):
+        project_id = int(data.rsplit(":", 1)[-1])
+        async with session_scope() as session:
+            project = await get_owned_or_admin_project(session, user, project_id)
+            runtime = project.runtime.value if hasattr(project.runtime, "value") else str(project.runtime)
+
+        await state_store.set_packages_wait(user.telegram_user_id, project_id=project.id, runtime=runtime)
+
+        runtime_label = "pip" if runtime == "python" else "npm"
+        example_block = (
+            "<pre>requests==2.32.3\naiofiles</pre>"
+            if runtime == "python"
+            else "<pre>express\naxios</pre>"
+        )
+
+        await safe_event_edit(
+            event,
+            "⚡ <b>Module Control</b>\n\n"
+            f"Terminal ready for <b>{escape(project.name)}</b>.\n"
+            f"Runtime channel: <code>{runtime_label}</code>\n\n"
+            "Enter package names separated by comma or new line.\n"
+            "Paste the queue now:\n"
+            f"{example_block}",
             parse_mode="html",
             buttons=project_actions_markup(project.id, project.status.value, is_admin=user.is_admin),
         )
@@ -746,6 +828,80 @@ async def message_router(event):
 
     state = await state_store.get_state(user.telegram_user_id)
     if not state:
+        return
+
+    if state["kind"] == "awaiting_packages":
+        if not event.raw_text:
+            await event.reply("Send package names as plain text, separated by comma or new line.")
+            return
+
+        packages = parse_package_input(event.raw_text)
+        if not packages:
+            await event.reply("No package names detected. Send comma or newline separated package names.")
+            return
+
+        progress_message = await event.reply(
+            "⏳ <b>Installing modules...</b>\n\n"
+            "<code>Resolving package queue and validating package names...</code>",
+            parse_mode="html",
+        )
+
+        project = None
+        try:
+            async with session_scope() as session:
+                db_user = await session.scalar(select(User).where(User.telegram_user_id == user.telegram_user_id))
+                project = await get_owned_or_admin_project(session, db_user, int(state["project_id"]))
+                runtime = state.get("runtime") or (project.runtime.value if hasattr(project.runtime, "value") else str(project.runtime))
+
+                module_manager = ModuleManagerService(session)
+                if runtime == "nodejs":
+                    result = await module_manager.install_npm_packages(project.id, packages)
+                    event_type = "NPM_PACKAGES_INSTALLED"
+                    summary = f"Requested npm install for {len(packages)} package(s) in {project.name}"
+                else:
+                    result = await module_manager.install_pip_packages(project.id, packages)
+                    event_type = "PIP_PACKAGES_INSTALLED"
+                    summary = f"Requested pip install for {len(packages)} package(s) in {project.name}"
+
+                await audit_service.record(
+                    session,
+                    event_type=event_type,
+                    summary=summary,
+                    severity="info" if result.get("success") else "warning",
+                    actor_user_id=db_user.id,
+                    target_user_id=project.owner_user_id,
+                    project_id=project.id,
+                    payload={
+                        "runtime": runtime,
+                        "packages": packages,
+                        "installed": result.get("installed", []),
+                        "failed": result.get("failed", []),
+                        "message": result.get("message"),
+                    },
+                )
+
+            await state_store.clear(user.telegram_user_id)
+            await progress_message.edit(
+                render_module_install_result(project, runtime, result),
+                parse_mode="html",
+                buttons=project_actions_markup(project.id, project.status.value, is_admin=user.is_admin),
+            )
+        except Exception as exc:
+            logger.exception("Package installation failed")
+            await state_store.clear(user.telegram_user_id)
+            buttons = (
+                project_actions_markup(project.id, project.status.value, is_admin=user.is_admin)
+                if project
+                else main_menu_markup(user.is_admin)
+            )
+            await progress_message.edit(
+                "❌ <b>Module Control Failure</b>\n\n"
+                "<code>Install session aborted.</code>\n"
+                f"Reason: <code>{escape(str(exc))}</code>\n\n"
+                "Retry from the project panel when ready.",
+                parse_mode="html",
+                buttons=buttons,
+            )
         return
 
     if state["kind"] == "awaiting_upload":
