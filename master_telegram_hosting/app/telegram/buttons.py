@@ -69,6 +69,7 @@ def project_actions_markup(project_id: int, status_value: str, is_admin: bool = 
             cb("❌ Reject", f"approval:reject:{project_id}:0", "danger", "❌"),
         ])
 
+    rows.append([cb("📦 Modules & Packages", f"project:modules:{project_id}", "primary")])
     rows.append([
         cb("🗂 Files", f"project:files:{project_id}:0", "primary", "🗂"),
         cb("🧪 Analysis", f"project:analysis:{project_id}", "primary", "🧪"),
